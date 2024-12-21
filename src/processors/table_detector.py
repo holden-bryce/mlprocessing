@@ -1,196 +1,274 @@
-import numpy as np
-from typing import Dict, List, Tuple, Optional
-import cv2
 import logging
-from dataclasses import dataclass
-
-@dataclass
-class TableCell:
-    text: str
-    bbox: List[int]
-    confidence: float
-    row_idx: int
-    col_idx: int
-
-@dataclass
-class Table:
-    cells: List[TableCell]
-    bbox: List[int]
-    num_rows: int
-    num_cols: int
-    headers: List[str]
+from typing import List, Dict
+import json
+import os
+from datetime import datetime
+import re
 
 class TableDetector:
-    def __init__(self, 
-                 min_confidence: float = 30.0,
-                 line_min_length: int = 50,
-                 line_threshold: int = 30):
-        self.min_confidence = min_confidence
-        self.line_min_length = line_min_length
-        self.line_threshold = line_threshold
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
         self.logger = logging.getLogger(__name__)
+        self.table_log_dir = os.path.join(output_dir, 'table_detection_logs')
+        os.makedirs(self.table_log_dir, exist_ok=True)
 
-    def detect_tables(self, 
-                     image: np.ndarray, 
-                     ocr_data: Dict) -> List[Table]:
-        """Detect tables in document image"""
+    def detect_tables(self, textract_data: Dict) -> Dict:
+        """
+        Process tables from AWS Textract output
+        """
         try:
-            # Detect table regions
-            table_regions = self._detect_table_regions(image)
-            
-            # Extract cells from each table region
+            blocks = textract_data.get('Blocks', [])
             tables = []
-            for region in table_regions:
-                table = self._extract_table_structure(
-                    region, 
-                    ocr_data
-                )
+            line_items = []
+
+            # Find all table blocks
+            table_blocks = [block for block in blocks if block['BlockType'] == 'TABLE']
+            
+            for table_block in table_blocks:
+                table = self._process_table_block(table_block, blocks)
                 if table:
                     tables.append(table)
+                    # Check if this is a line item table
+                    if self._is_line_item_table(table['headers']):
+                        items = self._process_line_items(table)
+                        line_items.extend(items)
+
+            results = {
+                'tables': tables,
+                'line_items': line_items
+            }
             
-            return tables
+            self._log_table_results(results)
+            return results
 
         except Exception as e:
             self.logger.error(f"Error detecting tables: {str(e)}")
+            raise
+
+    def _process_table_block(self, table_block: Dict, blocks: List[Dict]) -> Dict:
+        """
+        Process a single table block from Textract
+        """
+        try:
+            # Get table cells using relationships
+            cells = []
+            rows = []
+            current_row = []
+            current_row_num = 0
+
+            # Get all cells in the table
+            for relationship in table_block.get('Relationships', []):
+                if relationship['Type'] == 'CHILD':
+                    for cell_id in relationship['Ids']:
+                        cell_block = next((b for b in blocks if b['Id'] == cell_id), None)
+                        if cell_block:
+                            row_index = cell_block['RowIndex']
+                            col_index = cell_block['ColumnIndex']
+                            text = self._get_cell_text(cell_block, blocks)
+                            cells.append({
+                                'text': text,
+                                'row': row_index,
+                                'col': col_index
+                            })
+
+            # Sort cells by row and column
+            cells.sort(key=lambda x: (x['row'], x['col']))
+
+            # Group cells into rows
+            current_row = []
+            current_row_num = 1
+            for cell in cells:
+                if cell['row'] > current_row_num:
+                    if current_row:
+                        rows.append([c['text'] for c in current_row])
+                    current_row = []
+                    current_row_num = cell['row']
+                current_row.append(cell)
+            
+            if current_row:
+                rows.append([c['text'] for c in current_row])
+
+            # First row is headers
+            headers = rows[0] if rows else []
+            data_rows = rows[1:] if len(rows) > 1 else []
+
+            return {
+                'headers': headers,
+                'rows': data_rows,
+                'num_columns': len(headers),
+                'num_rows': len(data_rows),
+                'confidence': table_block.get('Confidence', 0)
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error processing table block: {str(e)}")
+            return None
+
+    def _get_cell_text(self, cell_block: Dict, blocks: List[Dict]) -> str:
+        """
+        Get text content from a cell block
+        """
+        text = cell_block.get('Text', '')
+        if not text and 'Relationships' in cell_block:
+            for relationship in cell_block['Relationships']:
+                if relationship['Type'] == 'CHILD':
+                    words = [
+                        block['Text']
+                        for block in blocks
+                        if block['Id'] in relationship['Ids']
+                        and block['BlockType'] == 'WORD'
+                    ]
+                    text = ' '.join(words)
+        return text.strip()
+
+    def _is_line_item_table(self, headers: List[str]) -> bool:
+        """
+        Determine if table contains line items
+        """
+        headers_str = ' '.join(str(h).lower() for h in headers)
+        return any([
+            'description' in headers_str,
+            'material' in headers_str,
+            'product' in headers_str,
+            'item' in headers_str,
+            'part' in headers_str,
+            'service' in headers_str
+        ])
+
+    def _process_line_items(self, table: Dict) -> List[Dict]:
+        """
+        Process line items from a table
+        """
+        try:
+            headers = table['headers']
+            rows = table['rows']
+            header_map = self._create_header_map(headers)
+            line_items = []
+
+            for row in rows:
+                if not self._is_summary_row(row):
+                    item = self._extract_line_item(row, header_map)
+                    if item and item['description']:
+                        line_items.append(item)
+
+            return line_items
+        except Exception as e:
+            self.logger.error(f"Error processing line items: {str(e)}")
             return []
 
-    def _detect_table_regions(self, image: np.ndarray) -> List[np.ndarray]:
-        """Detect table regions using line detection"""
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    def _create_header_map(self, headers: List[str]) -> Dict:
+        """
+        Create mapping of column types based on header names
+        """
+        header_map = {}
+        headers_str = [str(h).lower() for h in headers]
         
-        # Apply threshold
-        _, binary = cv2.threshold(
-            gray, 
-            0, 
-            255, 
-            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
+        for i, header in enumerate(headers_str):
+            # Description/Product/Material
+            if any(term in header for term in ['desc', 'product', 'material', 'item', 'part', 'service']):
+                header_map['description'] = i
+            
+            # Quantity
+            elif any(term in header for term in ['qty', 'quant', 'number', 'units']):
+                header_map['quantity'] = i
+            
+            # Price/Rate/Cost
+            elif any(term in header for term in ['price', 'rate', 'amount', 'cost']):
+                if 'unit' in header:
+                    header_map['unit_price'] = i
+                elif 'total' in header:
+                    header_map['total_price'] = i
+                else:
+                    header_map['price'] = i
+            
+            # UoM
+            elif any(term in header for term in ['uom', 'unit', 'measure']):
+                header_map['uom'] = i
+            
+            # Date
+            elif any(term in header for term in ['date', 'delivery', 'schedule']):
+                header_map['date'] = i
 
-        # Detect lines
-        horizontal = self._detect_lines(binary, 'horizontal')
-        vertical = self._detect_lines(binary, 'vertical')
+        return header_map
 
-        # Combine lines
-        table_mask = cv2.bitwise_or(horizontal, vertical)
-        
-        # Find table regions
-        contours, _ = cv2.findContours(
-            table_mask, 
-            cv2.RETR_EXTERNAL, 
-            cv2.CHAIN_APPROX_SIMPLE
-        )
+    def _is_summary_row(self, row: List[str]) -> bool:
+        """
+        Check if row is a summary row
+        """
+        row_str = ' '.join(str(cell).lower() for cell in row)
+        return any(term in row_str for term in [
+            'total', 'subtotal', '**', 'sum', 'amount due', 
+            'balance', 'tax', 'shipping'
+        ])
 
-        # Extract regions
-        regions = []
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            if w > self.line_min_length and h > self.line_min_length:
-                regions.append([x, y, x + w, y + h])
+    def _extract_line_item(self, row: List[str], header_map: Dict) -> Dict:
+        """
+        Extract line item from a row
+        """
+        try:
+            item = {
+                'description': '',
+                'quantity': 0,
+                'unit_price': 0,
+                'total_price': 0,
+                'uom': '',
+                'date': ''
+            }
 
-        return regions
+            for field, index in header_map.items():
+                if index < len(row):
+                    value = row[index]
+                    if field in ['quantity', 'unit_price', 'total_price', 'price']:
+                        item[field] = self._extract_number(value)
+                    else:
+                        item[field] = value.strip()
 
-    def _detect_lines(self, 
-                     binary: np.ndarray, 
-                     direction: str) -> np.ndarray:
-        """Detect lines in specific direction"""
-        if direction == 'horizontal':
-            kernel_length = binary.shape[1] // 40
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_length, 1))
-        else:
-            kernel_length = binary.shape[0] // 40
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_length))
+            # Calculate total price if missing
+            if not item['total_price'] and item['quantity'] and item['unit_price']:
+                item['total_price'] = item['quantity'] * item['unit_price']
 
-        # Apply morphology
-        detected = cv2.erode(binary, kernel, iterations=1)
-        detected = cv2.dilate(detected, kernel, iterations=1)
-
-        return detected
-
-    def _extract_table_structure(self, 
-                               region: List[int], 
-                               ocr_data: Dict) -> Optional[Table]:
-        """Extract table structure from region"""
-        # Filter OCR results within region
-        cells = self._get_cells_in_region(region, ocr_data)
-        if not cells:
+            return item
+        except Exception as e:
+            self.logger.error(f"Error extracting line item: {str(e)}")
             return None
 
-        # Group cells into rows and columns
-        rows = self._group_cells_into_rows(cells)
-        if not rows:
-            return None
+    def _extract_number(self, value: str) -> float:
+        """
+        Extract number from string
+        """
+        try:
+            if not value:
+                return 0
+            # Remove currency symbols and other non-numeric characters
+            clean_value = re.sub(r'[^\d.,\-]', '', str(value))
+            # Handle negative numbers
+            multiplier = -1 if '-' in clean_value else 1
+            # Remove thousands separators and convert to float
+            clean_value = clean_value.replace(',', '')
+            return float(clean_value) * multiplier
+        except:
+            return 0
 
-        # Identify headers
-        headers = self._identify_headers(rows[0])
-
-        return Table(
-            cells=cells,
-            bbox=region,
-            num_rows=len(rows),
-            num_cols=len(rows[0]),
-            headers=headers
-        )
-
-    def _get_cells_in_region(self, 
-                            region: List[int], 
-                            ocr_data: Dict) -> List[TableCell]:
-        """Get cells within table region"""
-        cells = []
-        for i in range(len(ocr_data["text"])):
-            bbox = ocr_data["boxes"][i]
-            if self._is_within_region(bbox, region):
-                cells.append(
-                    TableCell(
-                        text=ocr_data["text"][i],
-                        bbox=bbox,
-                        confidence=ocr_data["confidence"][i],
-                        row_idx=-1,  # Will be set later
-                        col_idx=-1   # Will be set later
-                    )
-                )
-        return cells
-
-    def _is_within_region(self, 
-                         bbox: List[int], 
-                         region: List[int]) -> bool:
-        """Check if bbox is within region"""
-        return (bbox[0] >= region[0] and bbox[2] <= region[2] and
-                bbox[1] >= region[1] and bbox[3] <= region[3])
-
-    def _group_cells_into_rows(self, 
-                              cells: List[TableCell]) -> List[List[TableCell]]:
-        """Group cells into rows based on vertical position"""
-        # Sort cells by y-coordinate
-        sorted_cells = sorted(cells, key=lambda x: (x.bbox[1], x.bbox[0]))
-        
-        rows = []
-        current_row = []
-        current_y = sorted_cells[0].bbox[1]
-        
-        for cell in sorted_cells:
-            if abs(cell.bbox[1] - current_y) > 10:  # Threshold for new row
-                if current_row:
-                    # Sort cells in row by x-coordinate
-                    current_row.sort(key=lambda x: x.bbox[0])
-                    rows.append(current_row)
-                current_row = [cell]
-                current_y = cell.bbox[1]
-            else:
-                current_row.append(cell)
-        
-        if current_row:
-            current_row.sort(key=lambda x: x.bbox[0])
-            rows.append(current_row)
-        
-        # Set row and column indices
-        for row_idx, row in enumerate(rows):
-            for col_idx, cell in enumerate(row):
-                cell.row_idx = row_idx
-                cell.col_idx = col_idx
-        
-        return rows
-
-    def _identify_headers(self, row: List[TableCell]) -> List[str]:
-        """Identify table headers from first row"""
-        return [cell.text for cell in row] 
+    def _log_table_results(self, results: Dict):
+        """
+        Log table detection results
+        """
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            log_filename = f'table_detection_log_{timestamp}.json'
+            log_path = os.path.join(self.table_log_dir, log_filename)
+            
+            log_data = {
+                'timestamp': timestamp,
+                'num_tables': len(results['tables']),
+                'num_line_items': len(results['line_items']),
+                'results': results
+            }
+            
+            with open(log_path, 'w', encoding='utf-8') as f:
+                json.dump(log_data, f, indent=2)
+            
+            self.logger.info(f"Table detection results logged to {log_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Error logging table results: {str(e)}") 
