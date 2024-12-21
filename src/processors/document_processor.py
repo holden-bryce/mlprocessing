@@ -4,10 +4,13 @@ from typing import Dict
 from datetime import datetime
 import json
 import torch
+from transformers import LayoutLMTokenizer
+
 from .ocr_processor import OCRProcessor
 from .field_extractor import FieldExtractor
 from .table_detector import TableDetector
 from .feature_generator import FeatureGenerator
+from .dataset_preparer import DatasetPreparer
 
 class DocumentProcessor:
     def __init__(
@@ -18,12 +21,8 @@ class DocumentProcessor:
         feature_generator: FeatureGenerator,
         output_dir: str
     ):
-        """
-        Initialize DocumentProcessor with all necessary components
-        """
-        # Set up model path
-        self.project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        self.model_path = os.path.join(self.project_root, 'models', 'layoutlm-base-uncased')
+        """Initialize DocumentProcessor with all necessary components"""
+        self.logger = logging.getLogger(__name__)
         
         # Initialize components
         self.ocr_processor = ocr_processor
@@ -31,33 +30,21 @@ class DocumentProcessor:
         self.table_detector = table_detector
         self.feature_generator = feature_generator
         self.output_dir = output_dir
-        self.logger = logging.getLogger(__name__)
         
-        # Ensure model directory exists
+        # Set up model path
+        self.project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.model_path = os.path.join(self.project_root, 'models', 'layoutlm-base-uncased')
+        
+        # Initialize dataset preparer
+        self.dataset_preparer = DatasetPreparer(output_dir=output_dir)
+        
+        # Create necessary directories
         os.makedirs(self.model_path, exist_ok=True)
-        
-        # Create document processing log directory
         self.doc_log_dir = os.path.join(output_dir, 'document_logs')
         os.makedirs(self.doc_log_dir, exist_ok=True)
-        
-        # Validate model path
-        self._validate_model_path()
-
-    def _validate_model_path(self):
-        """
-        Validate that required model files exist
-        """
-        required_files = ['config.json', 'pytorch_model.bin', 'tokenizer_config.json', 'vocab.txt']
-        missing_files = [f for f in required_files if not os.path.exists(os.path.join(self.model_path, f))]
-        
-        if missing_files:
-            self.logger.warning(f"Missing model files: {missing_files}")
-            self.logger.info("Model files will be downloaded if needed by components")
 
     def process_document(self, pdf_path: str) -> Dict:
-        """
-        Process a document through all stages
-        """
+        """Process a document through all stages and prepare for dataset"""
         try:
             # Start timing
             start_time = datetime.now()
@@ -77,7 +64,7 @@ class DocumentProcessor:
             self.logger.info("Detecting tables...")
             table_data = self.table_detector.detect_tables(ocr_result)
             
-            # 4. Feature Generation with local model path
+            # 4. Feature Generation
             self.logger.info("Generating features...")
             features = self.feature_generator.generate_features(
                 ocr_result=ocr_result,
@@ -85,10 +72,22 @@ class DocumentProcessor:
                 table_data=table_data
             )
             
+            # 5. Prepare for dataset
+            self.logger.info("Preparing training data...")
+            training_features = self.dataset_preparer.prepare_training_data(
+                features=features,
+                document_info={
+                    'filename': os.path.basename(pdf_path),
+                    'extracted_fields': extracted_fields,
+                    'table_data': table_data,
+                    'processing_date': datetime.now().isoformat()
+                }
+            )
+            
             # Calculate processing time
             processing_time = (datetime.now() - start_time).total_seconds()
             
-            # Get feature statistics safely
+            # Get feature statistics
             feature_stats = {
                 'num_tokens': features['input_ids'].size(1) if isinstance(features.get('input_ids'), torch.Tensor) else 0,
                 'num_words': len(features.get('words', [])),
@@ -116,12 +115,12 @@ class DocumentProcessor:
                 'extracted_fields': extracted_fields,
                 'table_data': table_data,
                 'features': serializable_features,
-                'model_path': self.model_path  # Include model path in result
+                'model_path': self.model_path,
+                'dataset_info': {
+                    'path': self.dataset_preparer.dataset_file,
+                    'summary': self.dataset_preparer.dataset_summary
+                }
             }
-            
-            # Validate output
-            if not self.validate_output(result):
-                raise ValueError("Invalid output format")
             
             # Log results
             self._log_processing_results(pdf_path, result)
@@ -138,9 +137,7 @@ class DocumentProcessor:
             }
 
     def _log_processing_results(self, pdf_path: str, result: Dict):
-        """
-        Log document processing results
-        """
+        """Log document processing results"""
         try:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = os.path.basename(pdf_path)
@@ -160,7 +157,8 @@ class DocumentProcessor:
                 'table_data': {
                     'num_tables': len(result['table_data'].get('tables', [])),
                     'tables': result['table_data'].get('tables', [])
-                }
+                },
+                'dataset_info': result.get('dataset_info', {})
             }
             
             # Save log file
@@ -172,70 +170,8 @@ class DocumentProcessor:
         except Exception as e:
             self.logger.error(f"Error logging processing results: {str(e)}")
 
-    def validate_output(self, result: Dict) -> bool:
-        """
-        Validate processing output
-        """
-        try:
-            # Check basic structure
-            if result.get('status') != 'success':
-                return False
-                
-            required_fields = [
-                'processing_time',
-                'output_path',
-                'statistics',
-                'features',
-                'extracted_fields',
-                'table_data',
-                'model_path'  # Added model_path validation
-            ]
-            
-            for field in required_fields:
-                if field not in result:
-                    self.logger.error(f"Missing required field: {field}")
-                    return False
-            
-            # Validate features structure
-            features = result['features']
-            required_feature_fields = [
-                'input_ids',
-                'attention_mask',
-                'token_type_ids',
-                'bbox',
-                'words',
-                'boxes'
-            ]
-            
-            for field in required_feature_fields:
-                if field not in features:
-                    self.logger.error(f"Missing required feature field: {field}")
-                    return False
-            
-            # Validate statistics
-            required_stats = [
-                'num_tokens',
-                'num_words',
-                'num_fields',
-                'num_tables',
-                'processing_time'
-            ]
-            
-            for stat in required_stats:
-                if stat not in result['statistics']:
-                    self.logger.error(f"Missing required statistic: {stat}")
-                    return False
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error validating output: {str(e)}")
-            return False
-
     def batch_process_documents(self, pdf_dir: str) -> Dict:
-        """
-        Process multiple documents in a directory
-        """
+        """Process multiple documents in a directory"""
         try:
             results = []
             failed_docs = []
@@ -273,7 +209,8 @@ class DocumentProcessor:
                 'average_processing_time': total_time / (len(results) + len(failed_docs)) if results or failed_docs else 0,
                 'failed_documents': failed_docs,
                 'output_directory': self.output_dir,
-                'model_path': self.model_path
+                'model_path': self.model_path,
+                'dataset_path': self.dataset_preparer.dataset_file
             }
             
             return summary
